@@ -12,7 +12,7 @@ Rust Node Package Manager CLI (like npm, but built in Rust)
 ## Installation
 
 ```bash
-git clone https://github.com/your-username/rnp.git
+git clone https://github.com/a-khushal/rnp.git
 cd rnp
 cargo build --release
 ```
