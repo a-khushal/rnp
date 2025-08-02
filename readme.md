@@ -19,7 +19,10 @@ cargo build --release
 
 ## Usage
 ```bash
-./target/release/rnp init or ./target/release/rnp init -y
-./target/release/rnp install <package-name>
+./target/release/rnp init
+./target/release/rnp init -y
+
+// WIP
+./target/release/rnp install <package-name> 
 ./target/release/rnp list
 ```
