@@ -4,6 +4,8 @@ use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
+use tar;
+use flate2;
 
 fn parse_npm_version(version_str: &str) -> Result<VersionReq, Box<dyn Error>> {
     let mut version_str = version_str.trim();
