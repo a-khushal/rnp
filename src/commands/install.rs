@@ -9,16 +9,10 @@ use flate2;
 
 fn parse_npm_version(version_str: &str) -> Result<VersionReq, Box<dyn Error>> {
     let mut version_str = version_str.trim();
+
     // Handle npm's "||" syntax by trying the first requirement.
     if version_str.contains("||") {
         version_str = version_str.split("||").next().unwrap_or("").trim();
-    }
-    // Handle hyphen ranges, e.g., "1.2.3 - 2.3.4" -> ">=1.2.3, <=2.3.4"
-    if let Some(pos) = version_str.find(" - ") {
-        let (start, end) = version_str.split_at(pos);
-        let end = &end[3..];
-        let formatted_req = format!(">={}, <={}", start.trim(), end.trim());
-        return Ok(VersionReq::parse(&formatted_req)?);
     }
 
     // Handle "x" or "*" wildcards
@@ -26,30 +20,53 @@ fn parse_npm_version(version_str: &str) -> Result<VersionReq, Box<dyn Error>> {
         // "1.2.x" becomes "~1.2.0" (>=1.2.0, <1.3.0)
         // "1.x" or "1.*" becomes "^1.0.0" (>=1.0.0, <2.0.0)
         let parts: Vec<&str> = version_str.split('.').collect();
-        let operator =
-            if parts.len() >= 2 && (parts[1] == "x" || parts[1] == "X" || parts[1] == "*") {
-                // Use caret for "1.x" style ranges
-                "^"
-            } else {
-                // Use tilde for "1.2.x" style ranges
-                "~"
-            };
+        let operator = if parts.len() >= 2 && (parts[1] == "x" || parts[1] == "X" || parts[1] == "*") {
+            "^" // caret for "1.x"
+        } else {
+            "~" // tilde for "1.2.x"
+        };
         let version_str_with_wildcard = version_str.replace(['x', 'X', '*'], "0");
         let formatted_req = format!("{}{}", operator, version_str_with_wildcard);
         return Ok(VersionReq::parse(&formatted_req)?);
     }
 
-    // Replace spaces between version parts with commas, as required by the semver crate.
-    // e.g., ">=1.0.0 <2.0.0" -> ">=1.0.0, <2.0.0"
-    if version_str.contains(' ') && version_str.contains(['<', '>']) {
-        let version_str_with_commas = version_str.replace(" ", ", ");
-        if let Ok(req) = VersionReq::parse(&version_str_with_commas) {
-            return Ok(req);
+    // Unified range cleanup section
+    let fixed = if version_str.contains(" - ") {
+        // "1.2.3 - 2.3.4" -> ">=1.2.3, <=2.3.4"
+        let (start, end) = version_str.split_once(" - ").unwrap();
+        format!(">={}, <={}", start.trim(), end.trim())
+    } else if version_str.contains('<') || version_str.contains('>') {
+        // ">= 2.1.2 < 3.0.0" -> ">=2.1.2, <3.0.0"
+        let mut result = String::new();
+        let mut last_was_op = false;
+        for token in version_str.split_whitespace() {
+            if token.starts_with('<') || token.starts_with('>') {
+                if !result.is_empty() {
+                    result.push_str(", ");
+                }
+                result.push_str(token);
+                last_was_op = true;
+            } else {
+                if last_was_op {
+                    result.push_str(token);
+                } else {
+                    if !result.is_empty() {
+                        result.push_str(", ");
+                    }
+                    result.push_str(token);
+                }
+                last_was_op = false;
+            }
         }
-    }
+        result
+    } else {
+        // Already valid
+        version_str.to_string()
+    };
 
-    Ok(VersionReq::parse(version_str)?)
+    Ok(VersionReq::parse(&fixed)?)
 }
+
 
 #[derive(Debug, Clone)]
 pub struct PackageInfo {
@@ -317,7 +334,7 @@ pub async fn handle_install_command_async(
         return Ok(());
     }
 
-    println!("🔍 Resolving dependency tree for {}...", package);
+    println!("\n🔍 Resolving dependency tree for {}...", package);
 
     let mut resolver = DependencyResolver::new();
 
@@ -332,7 +349,7 @@ pub async fn handle_install_command_async(
         }
     }
 
-    println!("Found {} packages to install", packages.len());
+    println!("\nFound {} package(s) to install", packages.len());
 
     // Find the root package (the one user requested, should be at depth 0)
     let root_package = packages
@@ -351,7 +368,7 @@ pub async fn handle_install_command_async(
     // Phase 3: Update package.json with the ROOT package version
     update_package_json(package, &root_package.info.version).await?;
 
-    println!("🎉 Successfully added {} packages!", total_installed);
+    println!("🎉 Successfully added {} package(s)!\n", total_installed);
     Ok(())
 }
 
@@ -384,7 +401,7 @@ async fn update_package_json(
     std::fs::write("package.json", formatted)?;
 
     println!(
-        "Updated package.json with {}@^{}",
+        "\nUpdated package.json with {}@^{}",
         package, resolved_version
     );
     Ok(())
