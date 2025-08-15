@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 
+mod cache;
 mod commands;
 use commands::{init::handle_init, install::handle_install_command_async};
 

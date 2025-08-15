@@ -3,9 +3,13 @@ use semver::{Version, VersionReq};
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::sync::Arc;
+use crate::cache::PackageCache;
 use tokio::sync::Semaphore;
 use tar;
 use flate2;
+use std::fs;
+use std::path::Path;
+use std::io::Cursor;
 
 fn parse_npm_version(version_str: &str) -> Result<VersionReq, Box<dyn Error>> {
     let mut version_str = version_str.trim();
@@ -288,20 +292,37 @@ impl DependencyResolver {
         client: Arc<reqwest::Client>,
         package: &PackageInfo,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        use std::fs;
-        use std::path::Path;
+        // Initialize cache
+        let cache = PackageCache::new()?;
 
-        // Download tarball
-        let response = client.get(&package.tarball_url).send().await?;
-        let bytes = response.bytes().await?;
+        // Check cache first
+        let bytes = if let Ok(cached_data) = cache.get_tarball(&package.name, &package.version.to_string()) {
+            // return cached data
+            cached_data
+        } else {
+            // if not cached, download it
+            let response = client.get(&package.tarball_url).send().await?;
+            let bytes = response.bytes().await?;
+            
+            // Save to cache for future use
+            if let Err(e) = cache.save_tarball(&package.name, &package.version.to_string(), &bytes) {
+                eprintln!("  ⚠️  Failed to cache {}@{}: {}", package.name, package.version, e);
+            }
+            bytes.to_vec()
+        };
 
         // Extract to node_modules
         let node_modules_path = Path::new("node_modules").join(&package.name);
         fs::create_dir_all(&node_modules_path)?;
 
-        // Extract tarball (similar to your existing code but with async/await)
-        let tar = flate2::read::GzDecoder::new(std::io::Cursor::new(bytes));
-        let mut archive = tar::Archive::new(tar);
+        // Extract tarball
+        /*
+            * Cursor wraps the Vec<u8> and makes it behave like a file
+            * Implements Read → lets libraries read bytes sequentially.
+            * Implements Seek → lets libraries jump around in the data if needed.
+        */
+        let tar = flate2::read::GzDecoder::new(Cursor::new(bytes)); // .tar.gz -> .tar
+        let mut archive = tar::Archive::new(tar); // .tar -> . i.e., each file in the tarball with proper directory structure
 
         for entry in archive.entries()? {
             let mut entry = entry?;
