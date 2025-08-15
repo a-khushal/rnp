@@ -67,7 +67,6 @@ pub struct ResolvedPackage {
 
 pub struct DependencyResolver {
     registry_client: Arc<reqwest::Client>,
-    resolved_packages: HashMap<String, ResolvedPackage>,
     conflicts: Vec<String>,
 }
 
@@ -75,64 +74,78 @@ impl DependencyResolver {
     pub fn new() -> Self {
         Self {
             registry_client: Arc::new(reqwest::Client::new()),
-            resolved_packages: HashMap::new(),
             conflicts: Vec::new(),
         }
     }
 
-    // Phase 1: Build complete dependency graph
+    // Phase-1: Build complete dependency graph
+    /*
+        * Box<...> -> A heap-allocated smart pointer (owned, single owner).
+        * dyn std::error::Error -> A trait object that can hold any type implementing the std::error::Error trait.
+        * Send -> The error type can be safely sent between threads.
+        * Sync -> The error type can be safely shared between threads.
+    */
     pub async fn resolve_dependencies(
         &mut self,
-        root_package: &str,
-    ) -> Result<Vec<ResolvedPackage>, Box<dyn std::error::Error + Send + Sync>> {
+        root_package: &str
+    ) -> Result<Vec<ResolvedPackage>, Box<dyn std::error::Error + Send + Sync>> { 
+        // local variable to store the packages to resolve
         let mut to_resolve: VecDeque<(String, VersionReq, usize)> = VecDeque::new();
+        // local variable to store the resolved packages
         let mut resolved: HashMap<String, (Version, usize)> = HashMap::new();
-
-        // Start with root package
+        // local variable to store the resolved packages
+        let mut resolved_packages: HashMap<String, ResolvedPackage> = HashMap::new();
+        
+        // push the root package to the to_resolve queue
         to_resolve.push_back((root_package.to_string(), VersionReq::parse("*")?, 0));
 
-        while let Some((pkg_name, version_req, depth)) = to_resolve.pop_front() {
-            // Skip if already resolved with compatible version
-            if let Some((existing_version, existing_depth)) = resolved.get(&pkg_name) {
-                if version_req.matches(existing_version) {
+        // classic BFS
+        while let Some((package_name, version_req, depth)) = to_resolve.pop_front() {
+            // if the package is already resolved, skip it
+            if let Some((existing_version_req, existing_depth)) = resolved.get(&package_name) {
+                // if the version requirement matches, skip it
+                if version_req.matches(existing_version_req) {
                     continue;
-                }
-                // Handle version conflict
+                } 
+
+                // if the depth is less than or equal to the existing depth, skip it
                 if depth <= *existing_depth {
                     self.conflicts.push(format!(
                         "Version conflict for {}: {} vs {}",
-                        pkg_name, version_req, existing_version
+                        package_name, version_req, existing_version_req
                     ));
                     continue;
                 }
             }
 
-            // Fetch package metadata
-            let package_info = self.fetch_package_metadata(&pkg_name, &version_req).await?;
+            // fetch the package metadata
+            let package_info = self.fetch_package_metadata(&package_name, &version_req).await?;
 
-            // Add to resolved packages
-            resolved.insert(pkg_name.clone(), (package_info.version.clone(), depth));
-            self.resolved_packages.insert(
-                pkg_name.clone(),
+            // insert the package into the resolved map
+            resolved.insert(package_name.clone(), (package_info.version.clone(), depth));
+
+            // insert the package into the resolved packages map which is global
+            resolved_packages.insert(
+                package_name.clone(),
                 ResolvedPackage {
                     info: package_info.clone(),
                     depth,
                 },
             );
 
-            // Add dependencies to resolution queue
+            // push the dependencies to the to_resolve queue
             for (dep_name, dep_version_req) in &package_info.dependencies {
                 to_resolve.push_back((dep_name.clone(), dep_version_req.clone(), depth + 1));
             }
         }
 
-        // Return packages sorted by dependency depth (deepest first for installation)
-        let mut packages: Vec<_> = self.resolved_packages.values().cloned().collect();
-        packages.sort_by(|a, b| b.depth.cmp(&a.depth));
-
+        // return the resolved packages from the global map
+        let mut packages = resolved_packages.values().cloned().collect::<Vec<_>>();
+        packages.sort_by_key(|p| p.depth);
         Ok(packages)
     }
-
+ 
+    // Fetch package metadata from the npm registry
     async fn fetch_package_metadata(
         &self,
         name: &str,
@@ -315,7 +328,7 @@ pub async fn handle_install_command_async(
     if !resolver.conflicts.is_empty() {
         println!("⚠️  Dependency conflicts detected:");
         for conflict in &resolver.conflicts {
-            println!("   {}", conflict);
+            println!("{}", conflict);
         }
     }
 
