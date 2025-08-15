@@ -1,6 +1,6 @@
-# RNP
+# RNP (Rust Node Package Manager)
 
-Rust Node Package Manager CLI (like npm, but built in Rust)
+A fast, reliable package manager for Node.js, built with Rust. RNP provides npm-like functionality with improved performance and reliability.
 
 ## 🚀 Features
 
@@ -8,6 +8,7 @@ Rust Node Package Manager CLI (like npm, but built in Rust)
 - `rnp init --yes` — Initialize with default values (no prompts)
 - `rnp install <package>` — Simulated install of a package
 - `rnp list` — List installed packages (coming soon)
+- `~/.rnp/cache` — Automatic tarball caching for faster installs
 
 ## Installation
 
@@ -56,7 +57,7 @@ rnp install <package-name>
 ### High Priority
 - [x] Basic package installation
 - [ ] **Caching System**
-  - [ ] TAR ball caching in `~/.rnp/cache`
+  - [x] TAR ball caching in `~/.rnp/cache`
   - [ ] Cache invalidation logic
   - [ ] Checksum verification
 - [ ] **Lockfile Support**
