@@ -12,6 +12,8 @@ A fast, reliable package manager for Node.js, built with Rust. RNP provides npm-
 - `rnp install --quiet <package>` — Minimal output
 - `rnp uninstall <package...>` — Remove package(s)
 - `rnp update [package...]` — Update one, many, or all dependencies
+- `rnp run <script> [args...]` — Run package scripts
+- `rnp audit` — Run security audit against npm advisories
 - `rnp list` — List installed packages (coming soon)
 - `~/.rnp/cache` — Automatic tarball caching for faster installs
 - `package-lock.json` — Generated lockfile for deterministic installs
@@ -40,6 +42,9 @@ cargo build --release
 ./target/release/rnp uninstall <package-name>
 ./target/release/rnp update
 ./target/release/rnp update <package-name>
+./target/release/rnp run test
+./target/release/rnp run build -- --watch
+./target/release/rnp audit
 ./target/release/rnp list
 ```
 
@@ -97,8 +102,8 @@ rnp install <package-name>
 ### Future Features
 - [x] `rnp uninstall` - Remove packages
 - [x] `rnp update` - Update packages
-- [ ] `rnp run` - Run package scripts
-- [ ] `rnp audit` - Security audits
+- [x] `rnp run` - Run package scripts
+- [x] `rnp audit` - Security audits
 
 ## 🤝 Contributing
 

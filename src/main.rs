@@ -3,8 +3,10 @@ use clap::{Parser, Subcommand};
 mod cache;
 mod commands;
 use commands::{
+    audit::handle_audit_command_async,
     init::handle_init,
     install::{InstallOptions, handle_install_command_async},
+    run::handle_run_command,
     uninstall::handle_uninstall_command,
     update::handle_update_command_async,
 };
@@ -50,6 +52,12 @@ enum Commands {
         #[arg(num_args = 0..)]
         packages: Vec<String>,
     },
+    Run {
+        script: String,
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
+    Audit,
     // List,
 }
 
@@ -95,6 +103,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 quiet,
             };
             handle_update_command_async(packages, options).await
+        },
+        Commands::Run { script, args } => {
+            handle_run_command(&script, &args)
+        },
+        Commands::Audit => {
+            handle_audit_command_async().await
         },
     }
 }
