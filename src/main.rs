@@ -19,6 +19,8 @@ enum Commands {
         yes: bool,
     },
     Install {
+        #[arg(long)]
+        no_package_lock: bool,
         package: String,
     },
     // List,
@@ -33,8 +35,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             handle_init(yes);
             Ok(())
         },
-        Commands::Install { package } => {
-            handle_install_command_async(&package).await
+        Commands::Install {
+            package,
+            no_package_lock,
+        } => {
+            handle_install_command_async(&package, no_package_lock).await
         },
     }
 }

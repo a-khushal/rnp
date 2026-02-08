@@ -7,8 +7,10 @@ A fast, reliable package manager for Node.js, built with Rust. RNP provides npm-
 - `rnp init` — Initialize a `package.json` file
 - `rnp init --yes` — Initialize with default values (no prompts)
 - `rnp install <package>` — Simulated install of a package
+- `rnp install <package> --no-package-lock` — Install without reading/writing lockfile
 - `rnp list` — List installed packages (coming soon)
 - `~/.rnp/cache` — Automatic tarball caching for faster installs
+- `package-lock.json` — Generated lockfile for deterministic installs
 
 ## Installation
 
@@ -25,6 +27,7 @@ cargo build --release
 ./target/release/rnp init
 ./target/release/rnp init -y
 ./target/release/rnp install <package-name>
+./target/release/rnp install <package-name> --no-package-lock
 ./target/release/rnp list
 ```
 
@@ -56,14 +59,14 @@ rnp install <package-name>
 
 ### High Priority
 - [x] Basic package installation
-- [ ] **Caching System**
+- [x] **Caching System**
   - [x] TAR ball caching in `~/.rnp/cache`
   - [x] Cache invalidation logic
   - [x] Checksum verification
-- [ ] **Lockfile Support**
-  - [ ] `package-lock.json` generation
-  - [ ] Deterministic installs from lockfile
-  - [ ] `--no-package-lock` flag
+- [x] **Lockfile Support**
+  - [x] `package-lock.json` generation
+  - [x] Deterministic installs from lockfile
+  - [x] `--no-package-lock` flag
 - [ ] **Node Modules**
   - [ ] Nested `node_modules` structure
   - [ ] Peer dependencies support

@@ -1,6 +1,7 @@
 use reqwest;
+use serde::{Deserialize, Serialize};
 use semver::{Version, VersionReq};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::error::Error;
 use std::sync::Arc;
 use crate::cache::PackageCache;
@@ -11,6 +12,26 @@ use std::fs;
 use std::path::Path;
 use std::io::Cursor;
 use std::time::Duration;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PackageLock {
+    name: String,
+    version: String,
+    #[serde(rename = "lockfileVersion")]
+    lockfile_version: u8,
+    requires: bool,
+    packages: BTreeMap<String, LockfilePackage>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct LockfilePackage {
+    version: String,
+    resolved: String,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    dependencies: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shasum: Option<String>,
+}
 
 fn parse_npm_version(version_str: &str) -> Result<VersionReq, Box<dyn Error>> {
     let mut version_str = version_str.trim();
@@ -110,7 +131,8 @@ impl DependencyResolver {
     */
     pub async fn resolve_dependencies(
         &mut self,
-        root_package: &str
+        root_package: &str,
+        locked_versions: Option<&HashMap<String, Version>>,
     ) -> Result<Vec<ResolvedPackage>, Box<dyn std::error::Error + Send + Sync>> { 
         // local variable to store the packages to resolve
         let mut to_resolve: VecDeque<(String, VersionReq, usize)> = VecDeque::new();
@@ -142,7 +164,10 @@ impl DependencyResolver {
             }
 
             // fetch the package metadata
-            let package_info = self.fetch_package_metadata(&package_name, &version_req).await?;
+            let locked_version = locked_versions.and_then(|m| m.get(&package_name));
+            let package_info = self
+                .fetch_package_metadata(&package_name, &version_req, locked_version)
+                .await?;
 
             // insert the package into the resolved map
             resolved.insert(package_name.clone(), (package_info.version.clone(), depth));
@@ -173,6 +198,7 @@ impl DependencyResolver {
         &self,
         name: &str,
         version_req: &VersionReq,
+        locked_version: Option<&Version>,
     ) -> Result<PackageInfo, Box<dyn std::error::Error + Send + Sync>> {
         let url = format!("https://registry.npmjs.org/{}", name);
         let response = self.registry_client.get(&url).send().await?;
@@ -183,7 +209,7 @@ impl DependencyResolver {
             .as_object()
             .ok_or("No versions found")?;
 
-        let best_version = self.find_best_version(versions.keys(), version_req)?;
+        let best_version = self.find_best_version(versions.keys(), version_req, locked_version)?;
         let version_info = &metadata["versions"][&best_version.to_string()];
 
         // Parse dependencies
@@ -233,11 +259,20 @@ impl DependencyResolver {
         &self,
         available_versions: serde_json::map::Keys,
         requirement: &VersionReq,
+        locked_version: Option<&Version>,
     ) -> Result<Version, Box<dyn std::error::Error + Send + Sync>> {
-        let mut matching_versions: Vec<Version> = available_versions
+        let matching_versions: Vec<Version> = available_versions
             .filter_map(|v| Version::parse(v).ok())
             .filter(|v| requirement.matches(v))
             .collect();
+
+        if let Some(locked) = locked_version {
+            if matching_versions.iter().any(|v| v == locked) {
+                return Ok(locked.clone());
+            }
+        }
+
+        let mut matching_versions = matching_versions;
 
         matching_versions.sort_by(|a, b| b.cmp(a)); // Descending order (latest first)
 
@@ -368,9 +403,78 @@ impl DependencyResolver {
     }
 }
 
+fn load_locked_versions() -> Result<HashMap<String, Version>, Box<dyn std::error::Error + Send + Sync>> {
+    let path = Path::new("package-lock.json");
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+
+    let data = std::fs::read_to_string(path)?;
+    let lockfile: PackageLock = serde_json::from_str(&data)?;
+
+    let mut locked_versions = HashMap::new();
+    for (name, locked_package) in lockfile.packages {
+        if let Ok(version) = Version::parse(&locked_package.version) {
+            locked_versions.insert(name, version);
+        }
+    }
+
+    Ok(locked_versions)
+}
+
+fn generate_lockfile(packages: &[ResolvedPackage]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let package_json_data = std::fs::read_to_string("package.json")?;
+    let package_json: serde_json::Value = serde_json::from_str(&package_json_data)?;
+
+    let root_name = package_json
+        .get("name")
+        .and_then(|value| value.as_str())
+        .unwrap_or("rnp-project")
+        .to_string();
+
+    let root_version = package_json
+        .get("version")
+        .and_then(|value| value.as_str())
+        .unwrap_or("1.0.0")
+        .to_string();
+
+    let mut lock_packages = BTreeMap::new();
+    for package in packages {
+        let dependencies = package
+            .info
+            .dependencies
+            .iter()
+            .map(|(name, req)| (name.clone(), req.to_string()))
+            .collect::<BTreeMap<_, _>>();
+
+        lock_packages.insert(
+            package.info.name.clone(),
+            LockfilePackage {
+                version: package.info.version.to_string(),
+                resolved: package.info.tarball_url.clone(),
+                dependencies,
+                shasum: package.info.shasum.clone(),
+            },
+        );
+    }
+
+    let lockfile = PackageLock {
+        name: root_name,
+        version: root_version,
+        lockfile_version: 1,
+        requires: true,
+        packages: lock_packages,
+    };
+
+    let serialized = serde_json::to_string_pretty(&lockfile)?;
+    std::fs::write("package-lock.json", serialized)?;
+    Ok(())
+}
+
 // Updated main install function
 pub async fn handle_install_command_async(
     package: &str,
+    no_package_lock: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let path = "package.json";
 
@@ -382,9 +486,16 @@ pub async fn handle_install_command_async(
     println!("\n🔍 Resolving dependency tree for {}...", package);
 
     let mut resolver = DependencyResolver::new();
+    let locked_versions = if no_package_lock {
+        HashMap::new()
+    } else {
+        load_locked_versions()?
+    };
 
     // Phase 1: Resolve all dependencies
-    let packages = resolver.resolve_dependencies(package).await?;
+    let packages = resolver
+        .resolve_dependencies(package, Some(&locked_versions))
+        .await?;
 
     // Report any conflicts
     if !resolver.conflicts.is_empty() {
@@ -412,6 +523,14 @@ pub async fn handle_install_command_async(
 
     // Phase 3: Update package.json with the ROOT package version
     update_package_json(package, &root_package.info.version).await?;
+
+    // Phase 4: Generate lockfile unless disabled by flag
+    if no_package_lock {
+        println!("\nSkipping package-lock.json generation (--no-package-lock)");
+    } else {
+        generate_lockfile(&packages)?;
+        println!("\nUpdated package-lock.json");
+    }
 
     println!("🎉 Successfully added {} package(s)!\n", total_installed);
     Ok(())
