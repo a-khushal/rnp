@@ -1,4 +1,6 @@
 use reqwest;
+use colored::Colorize;
+use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use semver::{Version, VersionReq};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -12,6 +14,39 @@ use std::fs;
 use std::path::Path;
 use std::io::Cursor;
 use std::time::Duration;
+
+#[derive(Debug, Clone, Copy)]
+pub struct InstallOptions {
+    pub no_package_lock: bool,
+    pub verbose: bool,
+    pub quiet: bool,
+}
+
+impl InstallOptions {
+    fn info(&self, message: &str) {
+        if !self.quiet {
+            println!("{}", message.cyan());
+        }
+    }
+
+    fn success(&self, message: &str) {
+        if !self.quiet {
+            println!("{}", message.green());
+        }
+    }
+
+    fn warn(&self, message: &str) {
+        if !self.quiet {
+            eprintln!("{}", message.yellow());
+        }
+    }
+
+    fn debug(&self, message: &str) {
+        if self.verbose && !self.quiet {
+            println!("{}", message.dimmed());
+        }
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct PackageLock {
@@ -99,6 +134,7 @@ pub struct PackageInfo {
     pub name: String,
     pub version: Version,
     pub dependencies: HashMap<String, VersionReq>,
+    pub peer_dependencies: HashMap<String, VersionReq>,
     pub tarball_url: String,
     pub shasum: Option<String>,
 }
@@ -185,6 +221,11 @@ impl DependencyResolver {
             for (dep_name, dep_version_req) in &package_info.dependencies {
                 to_resolve.push_back((dep_name.clone(), dep_version_req.clone(), depth + 1));
             }
+
+            // push peer dependencies as well
+            for (peer_name, peer_version_req) in &package_info.peer_dependencies {
+                to_resolve.push_back((peer_name.clone(), peer_version_req.clone(), depth + 1));
+            }
         }
 
         // return the resolved packages from the global map
@@ -214,8 +255,8 @@ impl DependencyResolver {
 
         // Parse dependencies
         let mut dependencies = HashMap::new();
-        if let Some(deps) = version_info.get("dependencies")
-            && let Some(deps_obj) = deps.as_object() {
+        if let Some(deps) = version_info.get("dependencies") {
+            if let Some(deps_obj) = deps.as_object() {
                 for (dep_name, dep_version) in deps_obj {
                     if let Some(version_str) = dep_version.as_str() {
                         match parse_npm_version(version_str) {
@@ -235,6 +276,31 @@ impl DependencyResolver {
                     }
                 }
             }
+        }
+
+        let mut peer_dependencies = HashMap::new();
+        if let Some(peer_deps) = version_info.get("peerDependencies") {
+            if let Some(peer_deps_obj) = peer_deps.as_object() {
+                for (dep_name, dep_version) in peer_deps_obj {
+                    if let Some(version_str) = dep_version.as_str() {
+                        match parse_npm_version(version_str) {
+                            Ok(req) => {
+                                peer_dependencies.insert(dep_name.clone(), req);
+                            }
+                            Err(e) => {
+                                println!(
+                                    "⚠️  Warning: Could not parse peer dependency for '{}': '{}'. Error: {}. Using '*' as fallback.",
+                                    dep_name, version_str, e
+                                );
+                                if let Ok(any_version_req) = VersionReq::parse("*") {
+                                    peer_dependencies.insert(dep_name.clone(), any_version_req);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         let tarball_url = version_info["dist"]["tarball"]
             .as_str()
@@ -249,6 +315,7 @@ impl DependencyResolver {
             name: name.to_string(),
             version: best_version,
             dependencies,
+            peer_dependencies,
             tarball_url,
             shasum,
         })
@@ -265,10 +332,11 @@ impl DependencyResolver {
             .filter(|v| requirement.matches(v))
             .collect();
 
-        if let Some(locked) = locked_version
-            && matching_versions.iter().any(|v| v == locked) {
+        if let Some(locked) = locked_version {
+            if matching_versions.iter().any(|v| v == locked) {
                 return Ok(locked.clone());
             }
+        }
 
         let mut matching_versions = matching_versions;
 
@@ -284,9 +352,22 @@ impl DependencyResolver {
     pub async fn install_packages_parallel(
         &self,
         packages: &Vec<ResolvedPackage>,
+        options: InstallOptions,
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         const MAX_CONCURRENT_DOWNLOADS: usize = 15;
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DOWNLOADS));
+        let progress = if options.quiet {
+            None
+        } else {
+            let pb = ProgressBar::new(packages.len() as u64);
+            pb.set_style(
+                ProgressStyle::with_template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+                    .unwrap()
+                    .progress_chars("##-"),
+            );
+            pb.set_message("installing packages");
+            Some(pb)
+        };
 
         // Group packages by depth for proper installation order
         let mut depth_groups: HashMap<usize, Vec<&ResolvedPackage>> = HashMap::new();
@@ -321,8 +402,15 @@ impl DependencyResolver {
             for handle in depth_handles {
                 if handle.await?? {
                     total_installed += 1;
+                    if let Some(pb) = &progress {
+                        pb.inc(1);
+                    }
                 }
             }
+        }
+
+        if let Some(pb) = &progress {
+            pb.finish_with_message("done");
         }
 
         Ok(total_installed)
@@ -351,14 +439,15 @@ impl DependencyResolver {
             let response = client.get(&package.tarball_url).send().await?;
             let bytes = response.bytes().await?;
 
-            if let Some(expected_shasum) = package.shasum.as_deref()
-                && !PackageCache::verify_sha1_checksum(bytes.as_ref(), expected_shasum) {
+            if let Some(expected_shasum) = package.shasum.as_deref() {
+                if !PackageCache::verify_sha1_checksum(bytes.as_ref(), expected_shasum) {
                     return Err(format!(
                         "Checksum verification failed for {}@{}",
                         package.name, package.version
                     )
                     .into());
                 }
+            }
             
             // Save to cache for future use
             if let Err(e) = cache.save_tarball(&package.name, &package_version, &bytes) {
@@ -468,22 +557,101 @@ fn generate_lockfile(packages: &[ResolvedPackage]) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
+fn validate_peer_dependencies(packages: &[ResolvedPackage], options: InstallOptions) {
+    let installed_versions: HashMap<&str, &Version> = packages
+        .iter()
+        .map(|p| (p.info.name.as_str(), &p.info.version))
+        .collect();
+
+    for package in packages {
+        for (peer_name, peer_req) in &package.info.peer_dependencies {
+            match installed_versions.get(peer_name.as_str()) {
+                Some(version) if peer_req.matches(version) => {
+                    options.debug(&format!(
+                        "peer dependency satisfied: {} -> {}@{}",
+                        package.info.name, peer_name, version
+                    ));
+                }
+                Some(version) => {
+                    options.warn(&format!(
+                        "peer dependency mismatch for {}: expected {} {}, found {}",
+                        package.info.name, peer_name, peer_req, version
+                    ));
+                }
+                None => {
+                    options.warn(&format!(
+                        "missing peer dependency for {}: {} {}",
+                        package.info.name, peer_name, peer_req
+                    ));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn symlink_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(src, dst)
+}
+
+#[cfg(windows)]
+fn symlink_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_dir(src, dst)
+}
+
+fn build_nested_node_modules(packages: &[ResolvedPackage], options: InstallOptions) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let root = Path::new("node_modules");
+    for package in packages {
+        let package_root = root.join(&package.info.name);
+        let nested = package_root.join("node_modules");
+        fs::create_dir_all(&nested)?;
+
+        for dep_name in package
+            .info
+            .dependencies
+            .keys()
+            .chain(package.info.peer_dependencies.keys())
+        {
+            let hoisted_dep = root.join(dep_name);
+            if !hoisted_dep.exists() {
+                continue;
+            }
+
+            let nested_dep = nested.join(dep_name);
+            if nested_dep.exists() {
+                continue;
+            }
+
+            if let Err(err) = symlink_dir(&hoisted_dep, &nested_dep) {
+                options.warn(&format!(
+                    "could not create nested symlink {} -> {} ({})",
+                    nested_dep.display(),
+                    hoisted_dep.display(),
+                    err
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 // Updated main install function
 pub async fn handle_install_command_async(
     package: &str,
-    no_package_lock: bool,
+    options: InstallOptions,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let path = "package.json";
 
     if !std::path::Path::new(path).exists() {
-        println!("❌ Error: package.json not found. Please run `rnp init` first.");
+        options.warn("package.json not found. Please run `rnp init` first.");
         return Ok(());
     }
 
-    println!("\n🔍 Resolving dependency tree for {}...", package);
+    options.info(&format!("Resolving dependency tree for {}...", package));
 
     let mut resolver = DependencyResolver::new();
-    let locked_versions = if no_package_lock {
+    let locked_versions = if options.no_package_lock {
         HashMap::new()
     } else {
         load_locked_versions()?
@@ -496,13 +664,13 @@ pub async fn handle_install_command_async(
 
     // Report any conflicts
     if !resolver.conflicts.is_empty() {
-        println!("⚠️  Dependency conflicts detected:");
+        options.warn("Dependency conflicts detected:");
         for conflict in &resolver.conflicts {
-            println!("{}", conflict);
+            options.warn(conflict);
         }
     }
 
-    println!("\nFound {} package(s) to install", packages.len());
+    options.info(&format!("Found {} package(s) to install", packages.len()));
 
     // Find the root package (the one user requested, should be at depth 0)
     let root_package = packages
@@ -510,32 +678,35 @@ pub async fn handle_install_command_async(
         .find(|p| p.info.name == package && p.depth == 0)
         .ok_or_else(|| format!("Root package '{}' not found in resolved packages", package))?;
 
-    println!(
-        "📝 Resolved {} to version {}",
-        package, root_package.info.version
-    );
+    options.info(&format!("Resolved {} to version {}", package, root_package.info.version));
+
+    validate_peer_dependencies(&packages, options);
 
     // Phase 2: Install packages in parallel
-    let total_installed = resolver.install_packages_parallel(&packages).await?;
+    let total_installed = resolver.install_packages_parallel(&packages, options).await?;
 
-    // Phase 3: Update package.json with the ROOT package version
-    update_package_json(package, &root_package.info.version).await?;
+    // Phase 3: Build nested node_modules links while keeping hoisted packages at root
+    build_nested_node_modules(&packages, options)?;
 
-    // Phase 4: Generate lockfile unless disabled by flag
-    if no_package_lock {
-        println!("\nSkipping package-lock.json generation (--no-package-lock)");
+    // Phase 4: Update package.json with the ROOT package version
+    update_package_json(package, &root_package.info.version, options).await?;
+
+    // Phase 5: Generate lockfile unless disabled by flag
+    if options.no_package_lock {
+        options.debug("Skipping package-lock.json generation (--no-package-lock)");
     } else {
         generate_lockfile(&packages)?;
-        println!("\nUpdated package-lock.json");
+        options.success("Updated package-lock.json");
     }
 
-    println!("🎉 Successfully added {} package(s)!\n", total_installed);
+    options.success(&format!("Successfully added {} package(s)!", total_installed));
     Ok(())
 }
 
 async fn update_package_json(
     package: &str,
     resolved_version: &Version,
+    options: InstallOptions,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Read existing package.json
     let data = std::fs::read_to_string("package.json")?;
@@ -561,9 +732,6 @@ async fn update_package_json(
     let formatted = serde_json::to_string_pretty(&json)?;
     std::fs::write("package.json", formatted)?;
 
-    println!(
-        "\nUpdated package.json with {}@^{}",
-        package, resolved_version
-    );
+    options.success(&format!("Updated package.json with {}@^{}", package, resolved_version));
     Ok(())
 }

@@ -8,9 +8,12 @@ A fast, reliable package manager for Node.js, built with Rust. RNP provides npm-
 - `rnp init --yes` — Initialize with default values (no prompts)
 - `rnp install <package>` — Simulated install of a package
 - `rnp install <package> --no-package-lock` — Install without reading/writing lockfile
+- `rnp install --verbose <package>` — Detailed logs
+- `rnp install --quiet <package>` — Minimal output
 - `rnp list` — List installed packages (coming soon)
 - `~/.rnp/cache` — Automatic tarball caching for faster installs
 - `package-lock.json` — Generated lockfile for deterministic installs
+- Progress bars and colorized output for install flow
 
 ## Installation
 
@@ -28,6 +31,8 @@ cargo build --release
 ./target/release/rnp init -y
 ./target/release/rnp install <package-name>
 ./target/release/rnp install <package-name> --no-package-lock
+./target/release/rnp install --verbose <package-name>
+./target/release/rnp install --quiet <package-name>
 ./target/release/rnp list
 ```
 
@@ -67,16 +72,16 @@ rnp install <package-name>
   - [x] `package-lock.json` generation
   - [x] Deterministic installs from lockfile
   - [x] `--no-package-lock` flag
-- [ ] **Node Modules**
-  - [ ] Nested `node_modules` structure
-  - [ ] Peer dependencies support
-  - [ ] Dependency hoisting
+- [x] **Node Modules**
+  - [x] Nested `node_modules` structure
+  - [x] Peer dependencies support
+  - [x] Dependency hoisting
 
 ### Medium Priority
-- [ ] **CLI Improvements**
-  - [ ] Progress bars
-  - [ ] Colorized output
-  - [ ] `--verbose` and `--quiet` flags
+- [x] **CLI Improvements**
+  - [x] Progress bars
+  - [x] Colorized output
+  - [x] `--verbose` and `--quiet` flags
 - [ ] **Dependency Resolution**
   - [ ] Peer dependencies
   - [ ] Optional dependencies

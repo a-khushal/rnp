@@ -2,7 +2,10 @@ use clap::{Parser, Subcommand};
 
 mod cache;
 mod commands;
-use commands::{init::handle_init, install::handle_install_command_async};
+use commands::{
+    init::handle_init,
+    install::{InstallOptions, handle_install_command_async},
+};
 
 #[derive(Parser)]
 #[command(name = "rnp")]
@@ -21,6 +24,10 @@ enum Commands {
     Install {
         #[arg(long)]
         no_package_lock: bool,
+        #[arg(short, long)]
+        verbose: bool,
+        #[arg(short, long)]
+        quiet: bool,
         package: String,
     },
     // List,
@@ -38,8 +45,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Commands::Install {
             package,
             no_package_lock,
+            verbose,
+            quiet,
         } => {
-            handle_install_command_async(&package, no_package_lock).await
+            handle_install_command_async(
+                &package,
+                InstallOptions {
+                    no_package_lock,
+                    verbose,
+                    quiet,
+                },
+            )
+            .await
         },
     }
 }
