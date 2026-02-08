@@ -1,9 +1,9 @@
-use serde::{Serialize};
+use serde::Serialize;
 use serde_json::{Map, Value};
-use std::fs::File;
-use std::io::Write;
 use std::env;
+use std::fs::File;
 use std::io;
+use std::io::Write;
 
 #[derive(Serialize, Debug)]
 struct Repository {
@@ -50,17 +50,21 @@ fn prompt(field: &str, default: &str) -> String {
 
 pub fn handle_init(yes: bool) {
     let current_dir = env::current_dir().unwrap();
-    let folder_name = current_dir.file_name().unwrap().to_str().unwrap().to_string();
-    
+    let folder_name = current_dir
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
     let mut default_scripts = Map::new();
     default_scripts.insert(
         "test".to_string(),
         Value::String("echo \"Error: no test specified\" && exit 1".to_string()),
     );
 
-    let pkg: PackageJson;
-    if yes {
-        pkg = PackageJson {
+    let pkg: PackageJson = if yes {
+        PackageJson {
             name: folder_name,
             version: "1.0.0".to_string(),
             description: "".to_string(),
@@ -71,7 +75,7 @@ pub fn handle_init(yes: bool) {
             license: "ISC".to_string(),
             type_field: "commonjs".to_string(),
             repository: None,
-        };
+        }
     } else {
         let name = prompt("package name", &folder_name);
         let version = prompt("version", "1.0.0");
@@ -85,7 +89,10 @@ pub fn handle_init(yes: bool) {
         let type_field = prompt("type", "commonjs");
 
         let keywords = if !keywords_input.is_empty() {
-            keywords_input.split_whitespace().map(|s| s.to_string()).collect()
+            keywords_input
+                .split_whitespace()
+                .map(|s| s.to_string())
+                .collect()
         } else {
             vec![]
         };
@@ -98,16 +105,16 @@ pub fn handle_init(yes: bool) {
                 url: git_url,
             })
         };
-                
+
         let scripts = if test_command.is_empty() {
             default_scripts
         } else {
             let mut scripts = Map::new();
             scripts.insert("test".to_string(), Value::String(test_command));
             scripts
-        };        
+        };
 
-        pkg = PackageJson {
+        PackageJson {
             name,
             version,
             description,
@@ -117,9 +124,9 @@ pub fn handle_init(yes: bool) {
             type_field,
             main,
             scripts,
-            repository
-        };
-    }
+            repository,
+        }
+    };
 
     let json = serde_json::to_string_pretty(&pkg).unwrap();
 

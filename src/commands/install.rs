@@ -214,8 +214,8 @@ impl DependencyResolver {
 
         // Parse dependencies
         let mut dependencies = HashMap::new();
-        if let Some(deps) = version_info.get("dependencies") {
-            if let Some(deps_obj) = deps.as_object() {
+        if let Some(deps) = version_info.get("dependencies")
+            && let Some(deps_obj) = deps.as_object() {
                 for (dep_name, dep_version) in deps_obj {
                     if let Some(version_str) = dep_version.as_str() {
                         match parse_npm_version(version_str) {
@@ -235,7 +235,6 @@ impl DependencyResolver {
                     }
                 }
             }
-        }
 
         let tarball_url = version_info["dist"]["tarball"]
             .as_str()
@@ -266,11 +265,10 @@ impl DependencyResolver {
             .filter(|v| requirement.matches(v))
             .collect();
 
-        if let Some(locked) = locked_version {
-            if matching_versions.iter().any(|v| v == locked) {
+        if let Some(locked) = locked_version
+            && matching_versions.iter().any(|v| v == locked) {
                 return Ok(locked.clone());
             }
-        }
 
         let mut matching_versions = matching_versions;
 
@@ -353,15 +351,14 @@ impl DependencyResolver {
             let response = client.get(&package.tarball_url).send().await?;
             let bytes = response.bytes().await?;
 
-            if let Some(expected_shasum) = package.shasum.as_deref() {
-                if !PackageCache::verify_sha1_checksum(bytes.as_ref(), expected_shasum) {
+            if let Some(expected_shasum) = package.shasum.as_deref()
+                && !PackageCache::verify_sha1_checksum(bytes.as_ref(), expected_shasum) {
                     return Err(format!(
                         "Checksum verification failed for {}@{}",
                         package.name, package.version
                     )
                     .into());
                 }
-            }
             
             // Save to cache for future use
             if let Err(e) = cache.save_tarball(&package.name, &package_version, &bytes) {
@@ -385,7 +382,7 @@ impl DependencyResolver {
 
         for entry in archive.entries()? {
             let mut entry = entry?;
-            let path = entry.path()?.to_owned();
+            let path = entry.path()?.into_owned();
 
             let mut components = path.components();
             components.next(); // Skip top-level folder

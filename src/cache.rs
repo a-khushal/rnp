@@ -1,4 +1,3 @@
-use dirs;
 use sha1::{Digest as Sha1Digest, Sha1};
 use sha2::Sha256;
 use std::error::Error;
@@ -70,11 +69,11 @@ impl PackageCache {
         }
 
         let data = std::fs::read(&path)?;
-        if let Some(expected) = expected_sha1 {
-            if !Self::verify_sha1_checksum(&data, expected) {
-                self.invalidate_tarball(package_name, version)?;
-                return Ok(None);
-            }
+        if let Some(expected) = expected_sha1
+            && !Self::verify_sha1_checksum(&data, expected)
+        {
+            self.invalidate_tarball(package_name, version)?;
+            return Ok(None);
         }
 
         Ok(Some(data))
