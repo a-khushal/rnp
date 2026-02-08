@@ -29,7 +29,8 @@ enum Commands {
         verbose: bool,
         #[arg(short, long)]
         quiet: bool,
-        package: String,
+        #[arg(required = true, num_args = 1..)]
+        packages: Vec<String>,
     },
     // List,
 }
@@ -44,20 +45,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         },
         Commands::Install {
-            package,
+            packages,
             no_package_lock,
             verbose,
             quiet,
         } => {
-            handle_install_command_async(
-                &package,
-                InstallOptions {
-                    no_package_lock,
-                    verbose,
-                    quiet,
-                },
-            )
-            .await
+            let options = InstallOptions {
+                no_package_lock,
+                verbose,
+                quiet,
+            };
+
+            for package in packages {
+                handle_install_command_async(&package, options).await?;
+            }
+
+            Ok(())
         },
     }
 }
