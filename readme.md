@@ -14,6 +14,7 @@ A fast, reliable package manager for Node.js, built with Rust. RNP provides npm-
 - `~/.rnp/cache` — Automatic tarball caching for faster installs
 - `package-lock.json` — Generated lockfile for deterministic installs
 - Progress bars and colorized output for install flow
+- Workspace-aware installs (basic monorepo support)
 
 ## Installation
 
@@ -82,10 +83,10 @@ rnp install <package-name>
   - [x] Progress bars
   - [x] Colorized output
   - [x] `--verbose` and `--quiet` flags
-- [ ] **Dependency Resolution**
-  - [ ] Peer dependencies
-  - [ ] Optional dependencies
-  - [ ] Workspaces/monorepo support
+- [x] **Dependency Resolution**
+  - [x] Peer dependencies
+  - [x] Optional dependencies
+  - [x] Workspaces/monorepo support
 
 ### Future Features
 - [ ] `rnp uninstall` - Remove packages

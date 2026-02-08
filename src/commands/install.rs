@@ -2,6 +2,7 @@ use reqwest;
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use semver::{Version, VersionReq};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::error::Error;
@@ -13,6 +14,7 @@ use flate2;
 use std::fs;
 use std::path::Path;
 use std::io::Cursor;
+use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy)]
@@ -135,8 +137,11 @@ pub struct PackageInfo {
     pub version: Version,
     pub dependencies: HashMap<String, VersionReq>,
     pub peer_dependencies: HashMap<String, VersionReq>,
+    pub optional_dependencies: HashMap<String, VersionReq>,
     pub tarball_url: String,
     pub shasum: Option<String>,
+    pub is_workspace: bool,
+    pub workspace_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -148,13 +153,21 @@ pub struct ResolvedPackage {
 pub struct DependencyResolver {
     registry_client: Arc<reqwest::Client>,
     conflicts: Vec<String>,
+    workspace_packages: HashMap<String, WorkspacePackage>,
+}
+
+#[derive(Debug, Clone)]
+struct WorkspacePackage {
+    version: Version,
+    path: PathBuf,
 }
 
 impl DependencyResolver {
-    pub fn new() -> Self {
+    fn new(workspace_packages: HashMap<String, WorkspacePackage>) -> Self {
         Self {
             registry_client: Arc::new(reqwest::Client::new()),
             conflicts: Vec::new(),
+            workspace_packages,
         }
     }
 
@@ -171,17 +184,17 @@ impl DependencyResolver {
         locked_versions: Option<&HashMap<String, Version>>,
     ) -> Result<Vec<ResolvedPackage>, Box<dyn std::error::Error + Send + Sync>> { 
         // local variable to store the packages to resolve
-        let mut to_resolve: VecDeque<(String, VersionReq, usize)> = VecDeque::new();
+        let mut to_resolve: VecDeque<(String, VersionReq, usize, bool)> = VecDeque::new();
         // local variable to store the resolved packages
         let mut resolved: HashMap<String, (Version, usize)> = HashMap::new();
         // local variable to store the resolved packages
         let mut resolved_packages: HashMap<String, ResolvedPackage> = HashMap::new();
         
         // push the root package to the to_resolve queue
-        to_resolve.push_back((root_package.to_string(), VersionReq::parse("*")?, 0));
+        to_resolve.push_back((root_package.to_string(), VersionReq::parse("*")?, 0, false));
 
         // classic BFS
-        while let Some((package_name, version_req, depth)) = to_resolve.pop_front() {
+        while let Some((package_name, version_req, depth, is_optional)) = to_resolve.pop_front() {
             // if the package is already resolved, skip it
             if let Some((existing_version_req, existing_depth)) = resolved.get(&package_name) {
                 // if the version requirement matches, skip it
@@ -201,9 +214,20 @@ impl DependencyResolver {
 
             // fetch the package metadata
             let locked_version = locked_versions.and_then(|m| m.get(&package_name));
-            let package_info = self
+            let package_info = match self
                 .fetch_package_metadata(&package_name, &version_req, locked_version)
-                .await?;
+                .await
+            {
+                Ok(info) => info,
+                Err(err) if is_optional => {
+                    self.conflicts.push(format!(
+                        "Skipping optional dependency {} ({}): {}",
+                        package_name, version_req, err
+                    ));
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
 
             // insert the package into the resolved map
             resolved.insert(package_name.clone(), (package_info.version.clone(), depth));
@@ -219,12 +243,16 @@ impl DependencyResolver {
 
             // push the dependencies to the to_resolve queue
             for (dep_name, dep_version_req) in &package_info.dependencies {
-                to_resolve.push_back((dep_name.clone(), dep_version_req.clone(), depth + 1));
+                to_resolve.push_back((dep_name.clone(), dep_version_req.clone(), depth + 1, false));
             }
 
             // push peer dependencies as well
             for (peer_name, peer_version_req) in &package_info.peer_dependencies {
-                to_resolve.push_back((peer_name.clone(), peer_version_req.clone(), depth + 1));
+                to_resolve.push_back((peer_name.clone(), peer_version_req.clone(), depth + 1, false));
+            }
+
+            for (opt_name, opt_version_req) in &package_info.optional_dependencies {
+                to_resolve.push_back((opt_name.clone(), opt_version_req.clone(), depth + 1, true));
             }
         }
 
@@ -241,6 +269,22 @@ impl DependencyResolver {
         version_req: &VersionReq,
         locked_version: Option<&Version>,
     ) -> Result<PackageInfo, Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(workspace_pkg) = self.workspace_packages.get(name) {
+            if version_req.matches(&workspace_pkg.version) {
+                return Ok(PackageInfo {
+                    name: name.to_string(),
+                    version: workspace_pkg.version.clone(),
+                    dependencies: HashMap::new(),
+                    peer_dependencies: HashMap::new(),
+                    optional_dependencies: HashMap::new(),
+                    tarball_url: String::new(),
+                    shasum: None,
+                    is_workspace: true,
+                    workspace_path: Some(workspace_pkg.path.clone()),
+                });
+            }
+        }
+
         let url = format!("https://registry.npmjs.org/{}", name);
         let response = self.registry_client.get(&url).send().await?;
         let metadata: serde_json::Value = response.json().await?;
@@ -302,6 +346,30 @@ impl DependencyResolver {
             }
         }
 
+        let mut optional_dependencies = HashMap::new();
+        if let Some(optional_deps) = version_info.get("optionalDependencies") {
+            if let Some(optional_deps_obj) = optional_deps.as_object() {
+                for (dep_name, dep_version) in optional_deps_obj {
+                    if let Some(version_str) = dep_version.as_str() {
+                        match parse_npm_version(version_str) {
+                            Ok(req) => {
+                                optional_dependencies.insert(dep_name.clone(), req);
+                            }
+                            Err(e) => {
+                                println!(
+                                    "⚠️  Warning: Could not parse optional dependency for '{}': '{}'. Error: {}. Using '*' as fallback.",
+                                    dep_name, version_str, e
+                                );
+                                if let Ok(any_version_req) = VersionReq::parse("*") {
+                                    optional_dependencies.insert(dep_name.clone(), any_version_req);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let tarball_url = version_info["dist"]["tarball"]
             .as_str()
             .ok_or("No tarball URL found")?
@@ -316,8 +384,11 @@ impl DependencyResolver {
             version: best_version,
             dependencies,
             peer_dependencies,
+            optional_dependencies,
             tarball_url,
             shasum,
+            is_workspace: false,
+            workspace_path: None,
         })
     }
 
@@ -422,6 +493,22 @@ impl DependencyResolver {
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         const CACHE_MAX_AGE: Duration = Duration::from_secs(60 * 60 * 24 * 7);
 
+        if package.is_workspace {
+            let src = package
+                .workspace_path
+                .as_ref()
+                .ok_or("Workspace package path not found")?;
+            let node_modules_path = Path::new("node_modules").join(&package.name);
+            if node_modules_path.exists() {
+                fs::remove_dir_all(&node_modules_path)?;
+            }
+
+            if let Err(_err) = symlink_dir(src, &node_modules_path) {
+                copy_dir_recursive(src, &node_modules_path)?;
+            }
+            return Ok(true);
+        }
+
         // Initialize cache
         let cache = PackageCache::new()?;
         let package_version = package.version.to_string();
@@ -508,6 +595,84 @@ fn load_locked_versions() -> Result<HashMap<String, Version>, Box<dyn std::error
     Ok(locked_versions)
 }
 
+fn expand_workspace_pattern(pattern: &str) -> Vec<PathBuf> {
+    if let Some(prefix) = pattern.strip_suffix("/*") {
+        let base = Path::new(prefix);
+        let mut paths = Vec::new();
+        if let Ok(entries) = fs::read_dir(base) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    paths.push(path);
+                }
+            }
+        }
+        return paths;
+    }
+
+    vec![PathBuf::from(pattern)]
+}
+
+fn load_workspace_packages() -> Result<HashMap<String, WorkspacePackage>, Box<dyn std::error::Error + Send + Sync>> {
+    let root_package_json = Path::new("package.json");
+    if !root_package_json.exists() {
+        return Ok(HashMap::new());
+    }
+
+    let data = fs::read_to_string(root_package_json)?;
+    let json: Value = serde_json::from_str(&data)?;
+    let mut workspace_patterns: Vec<String> = Vec::new();
+
+    if let Some(workspaces) = json.get("workspaces") {
+        if let Some(arr) = workspaces.as_array() {
+            for item in arr {
+                if let Some(pattern) = item.as_str() {
+                    workspace_patterns.push(pattern.to_string());
+                }
+            }
+        } else if let Some(packages) = workspaces.get("packages").and_then(|v| v.as_array()) {
+            for item in packages {
+                if let Some(pattern) = item.as_str() {
+                    workspace_patterns.push(pattern.to_string());
+                }
+            }
+        }
+    }
+
+    let mut workspace_packages = HashMap::new();
+    for pattern in workspace_patterns {
+        for workspace_dir in expand_workspace_pattern(&pattern) {
+            let workspace_package_json = workspace_dir.join("package.json");
+            if !workspace_package_json.exists() {
+                continue;
+            }
+
+            let workspace_data = fs::read_to_string(&workspace_package_json)?;
+            let workspace_json: Value = serde_json::from_str(&workspace_data)?;
+
+            let Some(name) = workspace_json.get("name").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let version_str = workspace_json
+                .get("version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("1.0.0");
+
+            if let Ok(version) = Version::parse(version_str) {
+                workspace_packages.insert(
+                    name.to_string(),
+                    WorkspacePackage {
+                        version,
+                        path: workspace_dir,
+                    },
+                );
+            }
+        }
+    }
+
+    Ok(workspace_packages)
+}
+
 fn generate_lockfile(packages: &[ResolvedPackage]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let package_json_data = std::fs::read_to_string("package.json")?;
     let package_json: serde_json::Value = serde_json::from_str(&package_json_data)?;
@@ -531,6 +696,20 @@ fn generate_lockfile(packages: &[ResolvedPackage]) -> Result<(), Box<dyn std::er
             .dependencies
             .iter()
             .map(|(name, req)| (name.clone(), req.to_string()))
+            .chain(
+                package
+                    .info
+                    .peer_dependencies
+                    .iter()
+                    .map(|(name, req)| (name.clone(), req.to_string())),
+            )
+            .chain(
+                package
+                    .info
+                    .optional_dependencies
+                    .iter()
+                    .map(|(name, req)| (name.clone(), req.to_string())),
+            )
             .collect::<BTreeMap<_, _>>();
 
         lock_packages.insert(
@@ -589,6 +768,23 @@ fn validate_peer_dependencies(packages: &[ResolvedPackage], options: InstallOpti
     }
 }
 
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+
+        if ty.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else if ty.is_file() {
+            fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn symlink_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::os::unix::fs::symlink(src, dst)
@@ -611,6 +807,7 @@ fn build_nested_node_modules(packages: &[ResolvedPackage], options: InstallOptio
             .dependencies
             .keys()
             .chain(package.info.peer_dependencies.keys())
+            .chain(package.info.optional_dependencies.keys())
         {
             let hoisted_dep = root.join(dep_name);
             if !hoisted_dep.exists() {
@@ -650,7 +847,8 @@ pub async fn handle_install_command_async(
 
     options.info(&format!("Resolving dependency tree for {}...", package));
 
-    let mut resolver = DependencyResolver::new();
+    let workspace_packages = load_workspace_packages()?;
+    let mut resolver = DependencyResolver::new(workspace_packages);
     let locked_versions = if options.no_package_lock {
         HashMap::new()
     } else {

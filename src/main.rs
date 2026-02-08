@@ -21,6 +21,7 @@ enum Commands {
         #[arg(short, long)]
         yes: bool,
     },
+    #[command(visible_alias = "i")]
     Install {
         #[arg(long)]
         no_package_lock: bool,
