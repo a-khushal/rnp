@@ -58,8 +58,8 @@ rnp install <package-name>
 - [x] Basic package installation
 - [ ] **Caching System**
   - [x] TAR ball caching in `~/.rnp/cache`
-  - [ ] Cache invalidation logic
-  - [ ] Checksum verification
+  - [x] Cache invalidation logic
+  - [x] Checksum verification
 - [ ] **Lockfile Support**
   - [ ] `package-lock.json` generation
   - [ ] Deterministic installs from lockfile

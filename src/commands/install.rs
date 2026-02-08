@@ -10,6 +10,7 @@ use flate2;
 use std::fs;
 use std::path::Path;
 use std::io::Cursor;
+use std::time::Duration;
 
 fn parse_npm_version(version_str: &str) -> Result<VersionReq, Box<dyn Error>> {
     let mut version_str = version_str.trim();
@@ -78,6 +79,7 @@ pub struct PackageInfo {
     pub version: Version,
     pub dependencies: HashMap<String, VersionReq>,
     pub tarball_url: String,
+    pub shasum: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -214,11 +216,16 @@ impl DependencyResolver {
             .ok_or("No tarball URL found")?
             .to_string();
 
+        let shasum = version_info["dist"]["shasum"]
+            .as_str()
+            .map(|value| value.to_string());
+
         Ok(PackageInfo {
             name: name.to_string(),
             version: best_version,
             dependencies,
             tarball_url,
+            shasum,
         })
     }
 
@@ -292,20 +299,37 @@ impl DependencyResolver {
         client: Arc<reqwest::Client>,
         package: &PackageInfo,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        const CACHE_MAX_AGE: Duration = Duration::from_secs(60 * 60 * 24 * 7);
+
         // Initialize cache
         let cache = PackageCache::new()?;
+        let package_version = package.version.to_string();
 
         // Check cache first
-        let bytes = if let Ok(cached_data) = cache.get_tarball(&package.name, &package.version.to_string()) {
-            // return cached data
+        let bytes = if let Some(cached_data) = cache.get_valid_tarball(
+            &package.name,
+            &package_version,
+            package.shasum.as_deref(),
+            CACHE_MAX_AGE,
+        )? {
             cached_data
         } else {
-            // if not cached, download it
+            // Cache miss, stale entry, or checksum mismatch: download again
             let response = client.get(&package.tarball_url).send().await?;
             let bytes = response.bytes().await?;
+
+            if let Some(expected_shasum) = package.shasum.as_deref() {
+                if !PackageCache::verify_sha1_checksum(bytes.as_ref(), expected_shasum) {
+                    return Err(format!(
+                        "Checksum verification failed for {}@{}",
+                        package.name, package.version
+                    )
+                    .into());
+                }
+            }
             
             // Save to cache for future use
-            if let Err(e) = cache.save_tarball(&package.name, &package.version.to_string(), &bytes) {
+            if let Err(e) = cache.save_tarball(&package.name, &package_version, &bytes) {
                 eprintln!("  ⚠️  Failed to cache {}@{}: {}", package.name, package.version, e);
             }
             bytes.to_vec()
