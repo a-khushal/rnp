@@ -1,4 +1,5 @@
 use reqwest;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
@@ -15,13 +16,20 @@ use std::fs;
 use std::path::Path;
 use std::io::Cursor;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::time::Duration;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use sha2::{Digest, Sha512};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct InstallOptions {
     pub no_package_lock: bool,
     pub verbose: bool,
     pub quiet: bool,
+    pub ignore_scripts: bool,
+    pub workspace: Option<String>,
+    pub hoist_strategy: String,
 }
 
 impl InstallOptions {
@@ -57,6 +65,10 @@ struct PackageLock {
     #[serde(rename = "lockfileVersion")]
     lockfile_version: u8,
     requires: bool,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    dependencies: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    workspace_paths: BTreeMap<String, String>,
     packages: BTreeMap<String, LockfilePackage>,
 }
 
@@ -64,70 +76,128 @@ struct PackageLock {
 struct LockfilePackage {
     version: String,
     resolved: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    integrity: Option<String>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
     dependencies: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     shasum: Option<String>,
 }
 
-fn parse_npm_version(version_str: &str) -> Result<VersionReq, Box<dyn Error>> {
-    let mut version_str = version_str.trim();
+#[derive(Debug, Clone)]
+pub struct NpmVersionReq {
+    raw: String,
+    clauses: Vec<VersionReq>,
+}
 
-    // Handle npm's "||" syntax by trying the first requirement.
-    if version_str.contains("||") {
-        version_str = version_str.split("||").next().unwrap_or("").trim();
+impl NpmVersionReq {
+    fn parse(input: &str) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        let raw = if input.trim().is_empty() { "*" } else { input.trim() }.to_string();
+        let mut clauses = Vec::new();
+
+        for clause in raw.split("||") {
+            let normalized = normalize_npm_clause(clause.trim());
+            clauses.push(VersionReq::parse(&normalized)?);
+        }
+
+        if clauses.is_empty() {
+            clauses.push(VersionReq::parse("*")?);
+        }
+
+        Ok(Self { raw, clauses })
     }
 
-    // Handle "x" or "*" wildcards
-    if version_str.contains(['x', 'X', '*']) {
-        // "1.2.x" becomes "~1.2.0" (>=1.2.0, <1.3.0)
-        // "1.x" or "1.*" becomes "^1.0.0" (>=1.0.0, <2.0.0)
-        let parts: Vec<&str> = version_str.split('.').collect();
-        let operator = if parts.len() >= 2 && (parts[1] == "x" || parts[1] == "X" || parts[1] == "*") {
-            "^" // caret for "1.x"
+    fn any() -> Result<Self, Box<dyn Error + Send + Sync>> {
+        Self::parse("*")
+    }
+
+    fn matches(&self, version: &Version) -> bool {
+        self.clauses.iter().any(|req| req.matches(version))
+    }
+
+    fn display(&self) -> String {
+        self.raw.clone()
+    }
+}
+
+impl std::fmt::Display for NpmVersionReq {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.raw)
+    }
+}
+
+fn normalize_npm_clause(clause: &str) -> String {
+    if clause.is_empty() || clause == "*" {
+        return "*".to_string();
+    }
+
+    if let Some((start, end)) = clause.split_once(" - ") {
+        return format!(">={}, <={}", start.trim(), end.trim());
+    }
+
+    if clause.contains('x') || clause.contains('X') || clause.contains('*') {
+        return normalize_wildcard_clause(clause);
+    }
+
+    let mut result = String::new();
+    let mut last_was_operator = false;
+    for token in clause.split_whitespace() {
+        if token.starts_with('<') || token.starts_with('>') {
+            if !result.is_empty() {
+                result.push_str(", ");
+            }
+            result.push_str(token);
+            last_was_operator = true;
         } else {
-            "~" // tilde for "1.2.x"
-        };
-        let version_str_with_wildcard = version_str.replace(['x', 'X', '*'], "0");
-        let formatted_req = format!("{}{}", operator, version_str_with_wildcard);
-        return Ok(VersionReq::parse(&formatted_req)?);
-    }
-
-    // Unified range cleanup section
-    let fixed = if version_str.contains(" - ") {
-        // "1.2.3 - 2.3.4" -> ">=1.2.3, <=2.3.4"
-        let (start, end) = version_str.split_once(" - ").unwrap();
-        format!(">={}, <={}", start.trim(), end.trim())
-    } else if version_str.contains('<') || version_str.contains('>') {
-        // ">= 2.1.2 < 3.0.0" -> ">=2.1.2, <3.0.0"
-        let mut result = String::new();
-        let mut last_was_op = false;
-        for token in version_str.split_whitespace() {
-            if token.starts_with('<') || token.starts_with('>') {
+            if last_was_operator {
+                result.push_str(token);
+            } else {
                 if !result.is_empty() {
                     result.push_str(", ");
                 }
                 result.push_str(token);
-                last_was_op = true;
-            } else {
-                if last_was_op {
-                    result.push_str(token);
-                } else {
-                    if !result.is_empty() {
-                        result.push_str(", ");
-                    }
-                    result.push_str(token);
-                }
-                last_was_op = false;
             }
+            last_was_operator = false;
         }
-        result
-    } else {
-        // Already valid
-        version_str.to_string()
-    };
+    }
 
-    Ok(VersionReq::parse(&fixed)?)
+    if result.is_empty() {
+        clause.to_string()
+    } else {
+        result
+    }
+}
+
+fn normalize_wildcard_clause(clause: &str) -> String {
+    let trimmed = clause.trim();
+    if trimmed == "*" || trimmed.eq_ignore_ascii_case("x") {
+        return "*".to_string();
+    }
+
+    let parts: Vec<&str> = trimmed.split('.').collect();
+    let major = parts.first().copied().unwrap_or("0");
+    let minor = parts.get(1).copied().unwrap_or("x");
+    let patch = parts.get(2).copied().unwrap_or("x");
+
+    let is_wild = |v: &str| v == "*" || v.eq_ignore_ascii_case("x");
+
+    if is_wild(major) {
+        return "*".to_string();
+    }
+
+    if is_wild(minor) {
+        let major_num = major.parse::<u64>().unwrap_or(0);
+        return format!(">={}.0.0, <{}.0.0", major_num, major_num + 1);
+    }
+
+    let major_num = major.parse::<u64>().unwrap_or(0);
+    let minor_num = minor.parse::<u64>().unwrap_or(0);
+
+    if is_wild(patch) {
+        return format!(">={}.{}.0, <{}.{}.0", major_num, minor_num, major_num, minor_num + 1);
+    }
+
+    clause.to_string()
 }
 
 
@@ -135,19 +205,26 @@ fn parse_npm_version(version_str: &str) -> Result<VersionReq, Box<dyn Error>> {
 pub struct PackageInfo {
     pub name: String,
     pub version: Version,
-    pub dependencies: HashMap<String, VersionReq>,
-    pub peer_dependencies: HashMap<String, VersionReq>,
-    pub optional_dependencies: HashMap<String, VersionReq>,
+    pub dependencies: HashMap<String, NpmVersionReq>,
+    pub peer_dependencies: HashMap<String, NpmVersionReq>,
+    pub optional_dependencies: HashMap<String, NpmVersionReq>,
     pub tarball_url: String,
+    pub integrity: Option<String>,
     pub shasum: Option<String>,
     pub is_workspace: bool,
     pub workspace_path: Option<PathBuf>,
+    pub engines_node: Option<NpmVersionReq>,
+    pub os_constraints: Vec<String>,
+    pub cpu_constraints: Vec<String>,
+    pub lifecycle_scripts: HashMap<String, String>,
+    pub bin_entries: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ResolvedPackage {
     pub info: PackageInfo,
     pub depth: usize,
+    pub optional: bool,
 }
 
 pub struct DependencyResolver {
@@ -184,14 +261,14 @@ impl DependencyResolver {
         locked_versions: Option<&HashMap<String, Version>>,
     ) -> Result<Vec<ResolvedPackage>, Box<dyn std::error::Error + Send + Sync>> { 
         // local variable to store the packages to resolve
-        let mut to_resolve: VecDeque<(String, VersionReq, usize, bool)> = VecDeque::new();
+        let mut to_resolve: VecDeque<(String, NpmVersionReq, usize, bool)> = VecDeque::new();
         // local variable to store the resolved packages
         let mut resolved: HashMap<String, (Version, usize)> = HashMap::new();
         // local variable to store the resolved packages
         let mut resolved_packages: HashMap<String, ResolvedPackage> = HashMap::new();
         
         // push the root package to the to_resolve queue
-        to_resolve.push_back((root_package.to_string(), VersionReq::parse("*")?, 0, false));
+        to_resolve.push_back((root_package.to_string(), NpmVersionReq::any()?, 0, false));
 
         // classic BFS
         while let Some((package_name, version_req, depth, is_optional)) = to_resolve.pop_front() {
@@ -206,7 +283,9 @@ impl DependencyResolver {
                 if depth <= *existing_depth {
                     self.conflicts.push(format!(
                         "Version conflict for {}: {} vs {}",
-                        package_name, version_req, existing_version_req
+                        package_name,
+                        version_req.display(),
+                        existing_version_req
                     ));
                     continue;
                 }
@@ -222,7 +301,9 @@ impl DependencyResolver {
                 Err(err) if is_optional => {
                     self.conflicts.push(format!(
                         "Skipping optional dependency {} ({}): {}",
-                        package_name, version_req, err
+                        package_name,
+                        version_req.display(),
+                        err
                     ));
                     continue;
                 }
@@ -238,6 +319,7 @@ impl DependencyResolver {
                 ResolvedPackage {
                     info: package_info.clone(),
                     depth,
+                    optional: is_optional,
                 },
             );
 
@@ -266,7 +348,7 @@ impl DependencyResolver {
     async fn fetch_package_metadata(
         &self,
         name: &str,
-        version_req: &VersionReq,
+        version_req: &NpmVersionReq,
         locked_version: Option<&Version>,
     ) -> Result<PackageInfo, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(workspace_pkg) = self.workspace_packages.get(name) {
@@ -278,9 +360,15 @@ impl DependencyResolver {
                     peer_dependencies: HashMap::new(),
                     optional_dependencies: HashMap::new(),
                     tarball_url: String::new(),
+                    integrity: None,
                     shasum: None,
                     is_workspace: true,
                     workspace_path: Some(workspace_pkg.path.clone()),
+                    engines_node: None,
+                    os_constraints: Vec::new(),
+                    cpu_constraints: Vec::new(),
+                    lifecycle_scripts: HashMap::new(),
+                    bin_entries: HashMap::new(),
                 });
             }
         }
@@ -303,7 +391,7 @@ impl DependencyResolver {
             if let Some(deps_obj) = deps.as_object() {
                 for (dep_name, dep_version) in deps_obj {
                     if let Some(version_str) = dep_version.as_str() {
-                        match parse_npm_version(version_str) {
+                        match NpmVersionReq::parse(version_str) {
                             Ok(req) => {
                                 dependencies.insert(dep_name.clone(), req);
                             }
@@ -312,7 +400,7 @@ impl DependencyResolver {
                                     "⚠️  Warning: Could not parse version requirement for '{}': '{}'. Error: {}. Using '*' as fallback.",
                                     dep_name, version_str, e
                                 );
-                                if let Ok(any_version_req) = VersionReq::parse("*") {
+                                if let Ok(any_version_req) = NpmVersionReq::any() {
                                     dependencies.insert(dep_name.clone(), any_version_req);
                                 }
                             }
@@ -327,7 +415,7 @@ impl DependencyResolver {
             if let Some(peer_deps_obj) = peer_deps.as_object() {
                 for (dep_name, dep_version) in peer_deps_obj {
                     if let Some(version_str) = dep_version.as_str() {
-                        match parse_npm_version(version_str) {
+                        match NpmVersionReq::parse(version_str) {
                             Ok(req) => {
                                 peer_dependencies.insert(dep_name.clone(), req);
                             }
@@ -336,7 +424,7 @@ impl DependencyResolver {
                                     "⚠️  Warning: Could not parse peer dependency for '{}': '{}'. Error: {}. Using '*' as fallback.",
                                     dep_name, version_str, e
                                 );
-                                if let Ok(any_version_req) = VersionReq::parse("*") {
+                                if let Ok(any_version_req) = NpmVersionReq::any() {
                                     peer_dependencies.insert(dep_name.clone(), any_version_req);
                                 }
                             }
@@ -351,7 +439,7 @@ impl DependencyResolver {
             if let Some(optional_deps_obj) = optional_deps.as_object() {
                 for (dep_name, dep_version) in optional_deps_obj {
                     if let Some(version_str) = dep_version.as_str() {
-                        match parse_npm_version(version_str) {
+                        match NpmVersionReq::parse(version_str) {
                             Ok(req) => {
                                 optional_dependencies.insert(dep_name.clone(), req);
                             }
@@ -360,7 +448,7 @@ impl DependencyResolver {
                                     "⚠️  Warning: Could not parse optional dependency for '{}': '{}'. Error: {}. Using '*' as fallback.",
                                     dep_name, version_str, e
                                 );
-                                if let Ok(any_version_req) = VersionReq::parse("*") {
+                                if let Ok(any_version_req) = NpmVersionReq::any() {
                                     optional_dependencies.insert(dep_name.clone(), any_version_req);
                                 }
                             }
@@ -379,6 +467,60 @@ impl DependencyResolver {
             .as_str()
             .map(|value| value.to_string());
 
+        let integrity = version_info["dist"]["integrity"]
+            .as_str()
+            .map(|value| value.to_string());
+
+        let engines_node = version_info
+            .get("engines")
+            .and_then(|v| v.get("node"))
+            .and_then(|v| v.as_str())
+            .and_then(|v| NpmVersionReq::parse(v).ok());
+
+        let os_constraints = version_info
+            .get("os")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let cpu_constraints = version_info
+            .get("cpu")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let mut lifecycle_scripts = HashMap::new();
+        if let Some(scripts_obj) = version_info.get("scripts").and_then(|v| v.as_object()) {
+            for script_name in ["preinstall", "install", "postinstall"] {
+                if let Some(command) = scripts_obj.get(script_name).and_then(|v| v.as_str()) {
+                    lifecycle_scripts.insert(script_name.to_string(), command.to_string());
+                }
+            }
+        }
+
+        let mut bin_entries = HashMap::new();
+        if let Some(bin) = version_info.get("bin") {
+            if let Some(single_bin) = bin.as_str() {
+                bin_entries.insert(default_bin_name(name), single_bin.to_string());
+            } else if let Some(bin_map) = bin.as_object() {
+                for (bin_name, bin_path) in bin_map {
+                    if let Some(bin_path_str) = bin_path.as_str() {
+                        bin_entries.insert(bin_name.clone(), bin_path_str.to_string());
+                    }
+                }
+            }
+        }
+
         Ok(PackageInfo {
             name: name.to_string(),
             version: best_version,
@@ -386,16 +528,22 @@ impl DependencyResolver {
             peer_dependencies,
             optional_dependencies,
             tarball_url,
+            integrity,
             shasum,
             is_workspace: false,
             workspace_path: None,
+            engines_node,
+            os_constraints,
+            cpu_constraints,
+            lifecycle_scripts,
+            bin_entries,
         })
     }
 
     fn find_best_version(
         &self,
         available_versions: serde_json::map::Keys,
-        requirement: &VersionReq,
+        requirement: &NpmVersionReq,
         locked_version: Option<&Version>,
     ) -> Result<Version, Box<dyn std::error::Error + Send + Sync>> {
         let matching_versions: Vec<Version> = available_versions
@@ -423,7 +571,8 @@ impl DependencyResolver {
     pub async fn install_packages_parallel(
         &self,
         packages: &Vec<ResolvedPackage>,
-        options: InstallOptions,
+        options: &InstallOptions,
+        node_version: Option<Version>,
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         const MAX_CONCURRENT_DOWNLOADS: usize = 15;
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DOWNLOADS));
@@ -459,11 +608,14 @@ impl DependencyResolver {
             for package in packages_at_depth {
                 let semaphore = Arc::clone(&semaphore);
                 let client = Arc::clone(&self.registry_client);
-                let package_info = package.info.clone(); // ← Clone BEFORE async move
+                let package_to_install = package.clone();
+                let node_version = node_version.clone();
+                let options = options.clone();
 
                 let handle = tokio::spawn(async move {
                     let _permit = semaphore.acquire().await.unwrap();
-                    Self::download_and_extract_package(client, &package_info).await
+                    Self::download_and_extract_package(client, &package_to_install, &options, node_version)
+                        .await
                 });
 
                 depth_handles.push(handle);
@@ -489,16 +641,27 @@ impl DependencyResolver {
 
     async fn download_and_extract_package(
         client: Arc<reqwest::Client>,
-        package: &PackageInfo,
+        package: &ResolvedPackage,
+        options: &InstallOptions,
+        node_version: Option<Version>,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         const CACHE_MAX_AGE: Duration = Duration::from_secs(60 * 60 * 24 * 7);
 
-        if package.is_workspace {
+        if let Err(reason) = validate_package_constraints(&package.info, node_version.as_ref()) {
+            if package.optional {
+                options.warn(&format!("Skipping optional dependency {}: {}", package.info.name, reason));
+                return Ok(false);
+            }
+            return Err(reason.into());
+        }
+
+        if package.info.is_workspace {
             let src = package
+                .info
                 .workspace_path
                 .as_ref()
                 .ok_or("Workspace package path not found")?;
-            let node_modules_path = Path::new("node_modules").join(&package.name);
+            let node_modules_path = Path::new("node_modules").join(&package.info.name);
             if node_modules_path.exists() {
                 fs::remove_dir_all(&node_modules_path)?;
             }
@@ -511,40 +674,45 @@ impl DependencyResolver {
 
         // Initialize cache
         let cache = PackageCache::new()?;
-        let package_version = package.version.to_string();
+        let package_version = package.info.version.to_string();
 
         // Check cache first
         let bytes = if let Some(cached_data) = cache.get_valid_tarball(
-            &package.name,
+            &package.info.name,
             &package_version,
-            package.shasum.as_deref(),
+            package.info.shasum.as_deref(),
             CACHE_MAX_AGE,
         )? {
-            cached_data
+            if verify_tarball_integrity(&package.info, &cached_data).is_ok() {
+                cached_data
+            } else {
+                cache.invalidate_tarball(&package.info.name, &package_version)?;
+                let response = client.get(&package.info.tarball_url).send().await?;
+                let bytes = response.bytes().await?;
+                verify_tarball_integrity(&package.info, bytes.as_ref())
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+                if let Err(e) = cache.save_tarball(&package.info.name, &package_version, &bytes) {
+                    eprintln!("  ⚠️  Failed to cache {}@{}: {}", package.info.name, package.info.version, e);
+                }
+                bytes.to_vec()
+            }
         } else {
             // Cache miss, stale entry, or checksum mismatch: download again
-            let response = client.get(&package.tarball_url).send().await?;
+            let response = client.get(&package.info.tarball_url).send().await?;
             let bytes = response.bytes().await?;
 
-            if let Some(expected_shasum) = package.shasum.as_deref() {
-                if !PackageCache::verify_sha1_checksum(bytes.as_ref(), expected_shasum) {
-                    return Err(format!(
-                        "Checksum verification failed for {}@{}",
-                        package.name, package.version
-                    )
-                    .into());
-                }
-            }
-            
+            verify_tarball_integrity(&package.info, bytes.as_ref())
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+
             // Save to cache for future use
-            if let Err(e) = cache.save_tarball(&package.name, &package_version, &bytes) {
-                eprintln!("  ⚠️  Failed to cache {}@{}: {}", package.name, package.version, e);
+            if let Err(e) = cache.save_tarball(&package.info.name, &package_version, &bytes) {
+                eprintln!("  ⚠️  Failed to cache {}@{}: {}", package.info.name, package.info.version, e);
             }
             bytes.to_vec()
         };
 
         // Extract to node_modules
-        let node_modules_path = Path::new("node_modules").join(&package.name);
+        let node_modules_path = Path::new("node_modules").join(&package.info.name);
         fs::create_dir_all(&node_modules_path)?;
 
         // Extract tarball
@@ -572,6 +740,9 @@ impl DependencyResolver {
             entry.unpack(dest_path)?;
         }
 
+        create_bin_links(&package.info, &node_modules_path)?;
+        run_lifecycle_scripts(&package.info, &node_modules_path, options)?;
+
         Ok(true)
     }
 }
@@ -586,13 +757,28 @@ fn load_locked_versions() -> Result<HashMap<String, Version>, Box<dyn std::error
     let lockfile: PackageLock = serde_json::from_str(&data)?;
 
     let mut locked_versions = HashMap::new();
-    for (name, locked_package) in lockfile.packages {
+    for (path_key, locked_package) in lockfile.packages {
+        let Some(name) = lockfile_package_name(&path_key) else {
+            continue;
+        };
         if let Ok(version) = Version::parse(&locked_package.version) {
-            locked_versions.insert(name, version);
+            locked_versions.insert(name.to_string(), version);
         }
     }
 
     Ok(locked_versions)
+}
+
+fn lockfile_package_name(path_key: &str) -> Option<&str> {
+    if path_key.is_empty() {
+        return None;
+    }
+
+    if path_key.contains("node_modules/") {
+        return path_key.rsplit("node_modules/").next();
+    }
+
+    Some(path_key)
 }
 
 fn expand_workspace_pattern(pattern: &str) -> Vec<PathBuf> {
@@ -673,6 +859,36 @@ fn load_workspace_packages() -> Result<HashMap<String, WorkspacePackage>, Box<dy
     Ok(workspace_packages)
 }
 
+fn workspace_manifest_path(
+    workspace_name: Option<&str>,
+    workspace_packages: &HashMap<String, WorkspacePackage>,
+) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(name) = workspace_name {
+        let workspace = workspace_packages
+            .get(name)
+            .ok_or_else(|| format!("Workspace '{}' not found", name))?;
+        return Ok(workspace.path.join("package.json"));
+    }
+
+    Ok(PathBuf::from("package.json"))
+}
+
+fn read_manifest_dependencies_from(path: &Path) -> Result<BTreeMap<String, String>, Box<dyn std::error::Error + Send + Sync>> {
+    let data = fs::read_to_string(path)?;
+    let json: Value = serde_json::from_str(&data)?;
+    let dependencies = json
+        .get("dependencies")
+        .and_then(|v| v.as_object())
+        .map(|deps| {
+            deps.iter()
+                .filter_map(|(name, val)| val.as_str().map(|s| (name.clone(), s.to_string())))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+
+    Ok(dependencies)
+}
+
 fn generate_lockfile(packages: &[ResolvedPackage]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let package_json_data = std::fs::read_to_string("package.json")?;
     let package_json: serde_json::Value = serde_json::from_str(&package_json_data)?;
@@ -689,34 +905,62 @@ fn generate_lockfile(packages: &[ResolvedPackage]) -> Result<(), Box<dyn std::er
         .unwrap_or("1.0.0")
         .to_string();
 
+    let root_dependencies = package_json
+        .get("dependencies")
+        .and_then(|v| v.as_object())
+        .map(|deps| {
+            deps.iter()
+                .filter_map(|(name, val)| val.as_str().map(|s| (name.clone(), s.to_string())))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+
+    let workspace_paths = load_workspace_packages()?
+        .into_iter()
+        .map(|(name, pkg)| (name, pkg.path.to_string_lossy().to_string()))
+        .collect::<BTreeMap<_, _>>();
+
     let mut lock_packages = BTreeMap::new();
+    lock_packages.insert(
+        "".to_string(),
+        LockfilePackage {
+            version: root_version.clone(),
+            resolved: String::new(),
+            integrity: None,
+            dependencies: root_dependencies.clone(),
+            shasum: None,
+        },
+    );
+
     for package in packages {
         let dependencies = package
             .info
             .dependencies
             .iter()
-            .map(|(name, req)| (name.clone(), req.to_string()))
+            .map(|(name, req)| (name.clone(), req.display()))
             .chain(
                 package
                     .info
                     .peer_dependencies
                     .iter()
-                    .map(|(name, req)| (name.clone(), req.to_string())),
+                    .map(|(name, req)| (name.clone(), req.display())),
             )
             .chain(
                 package
                     .info
                     .optional_dependencies
                     .iter()
-                    .map(|(name, req)| (name.clone(), req.to_string())),
+                    .map(|(name, req)| (name.clone(), req.display())),
             )
             .collect::<BTreeMap<_, _>>();
 
+        let lock_path = format!("node_modules/{}", package.info.name);
         lock_packages.insert(
-            package.info.name.clone(),
+            lock_path,
             LockfilePackage {
                 version: package.info.version.to_string(),
                 resolved: package.info.tarball_url.clone(),
+                integrity: package.info.integrity.clone(),
                 dependencies,
                 shasum: package.info.shasum.clone(),
             },
@@ -728,6 +972,8 @@ fn generate_lockfile(packages: &[ResolvedPackage]) -> Result<(), Box<dyn std::er
         version: root_version,
         lockfile_version: 1,
         requires: true,
+        dependencies: root_dependencies,
+        workspace_paths,
         packages: lock_packages,
     };
 
@@ -736,7 +982,77 @@ fn generate_lockfile(packages: &[ResolvedPackage]) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
-fn validate_peer_dependencies(packages: &[ResolvedPackage], options: InstallOptions) {
+fn packages_from_lockfile(
+    lockfile: &PackageLock,
+) -> Result<Vec<ResolvedPackage>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut packages = Vec::new();
+
+    for (path_key, locked) in &lockfile.packages {
+        let Some(name) = lockfile_package_name(path_key) else {
+            continue;
+        };
+
+        let version = Version::parse(&locked.version)?;
+        let dependencies = locked
+            .dependencies
+            .iter()
+            .filter_map(|(dep, req)| NpmVersionReq::parse(req).ok().map(|r| (dep.clone(), r)))
+            .collect::<HashMap<_, _>>();
+
+        let depth = path_key.matches("node_modules/").count();
+
+        let workspace_path = lockfile.workspace_paths.get(name).map(PathBuf::from);
+        let is_workspace = workspace_path.is_some();
+
+        let info = PackageInfo {
+            name: name.to_string(),
+            version,
+            dependencies,
+            peer_dependencies: HashMap::new(),
+            optional_dependencies: HashMap::new(),
+            tarball_url: locked.resolved.clone(),
+            integrity: locked.integrity.clone(),
+            shasum: locked.shasum.clone(),
+            is_workspace,
+            workspace_path,
+            engines_node: None,
+            os_constraints: Vec::new(),
+            cpu_constraints: Vec::new(),
+            lifecycle_scripts: HashMap::new(),
+            bin_entries: HashMap::new(),
+        };
+
+        packages.push(ResolvedPackage {
+            info,
+            depth,
+            optional: false,
+        });
+    }
+
+    Ok(packages)
+}
+
+fn ensure_lockfile_in_sync(
+    lockfile: &PackageLock,
+    manifest_path: &Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if manifest_path != Path::new("package.json") {
+        return Ok(());
+    }
+
+    let manifest_deps = read_manifest_dependencies_from(manifest_path)?;
+    if manifest_deps != lockfile.dependencies {
+        return Err(format!(
+            "{} and package-lock.json are out of sync. Run `rnp install` first.",
+            manifest_path.display()
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
+fn validate_peer_dependencies(packages: &[ResolvedPackage], options: &InstallOptions) {
     let installed_versions: HashMap<&str, &Version> = packages
         .iter()
         .map(|p| (p.info.name.as_str(), &p.info.version))
@@ -768,6 +1084,234 @@ fn validate_peer_dependencies(packages: &[ResolvedPackage], options: InstallOpti
     }
 }
 
+fn default_bin_name(package_name: &str) -> String {
+    package_name
+        .rsplit('/')
+        .next()
+        .unwrap_or(package_name)
+        .to_string()
+}
+
+fn current_node_version() -> Option<Version> {
+    let output = Command::new("node").arg("--version").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let trimmed = raw.trim().trim_start_matches('v');
+    Version::parse(trimmed).ok()
+}
+
+fn current_node_os() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "darwin",
+        "windows" => "win32",
+        other => other,
+    }
+}
+
+fn current_node_cpu() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "x86" => "ia32",
+        "aarch64" => "arm64",
+        "arm" => "arm",
+        other => other,
+    }
+}
+
+fn verify_integrity_sha512(data: &[u8], integrity: &str) -> bool {
+    let Some(encoded) = integrity.strip_prefix("sha512-") else {
+        return false;
+    };
+
+    let Ok(expected_bytes) = STANDARD.decode(encoded) else {
+        return false;
+    };
+
+    let mut hasher = Sha512::new();
+    hasher.update(data);
+    let actual = hasher.finalize();
+    actual.as_slice() == expected_bytes.as_slice()
+}
+
+fn verify_tarball_integrity(package: &PackageInfo, data: &[u8]) -> Result<(), String> {
+    if let Some(integrity) = package.integrity.as_deref() {
+        if !verify_integrity_sha512(data, integrity) {
+            return Err(format!(
+                "integrity verification failed for {}@{}",
+                package.name, package.version
+            ));
+        }
+        return Ok(());
+    }
+
+    if let Some(expected_shasum) = package.shasum.as_deref()
+        && !PackageCache::verify_sha1_checksum(data, expected_shasum)
+    {
+        return Err(format!(
+            "checksum verification failed for {}@{}",
+            package.name, package.version
+        ));
+    }
+
+    Ok(())
+}
+
+fn constraint_allows_current(constraints: &[String], current: &str) -> bool {
+    if constraints.is_empty() {
+        return true;
+    }
+
+    let mut positive = Vec::new();
+    let mut negative = Vec::new();
+    for rule in constraints {
+        if let Some(excluded) = rule.strip_prefix('!') {
+            negative.push(excluded);
+        } else {
+            positive.push(rule.as_str());
+        }
+    }
+
+    if negative.iter().any(|item| *item == current) {
+        return false;
+    }
+
+    if positive.is_empty() {
+        true
+    } else {
+        positive.iter().any(|item| *item == current)
+    }
+}
+
+fn validate_package_constraints(
+    package: &PackageInfo,
+    node_version: Option<&Version>,
+) -> Result<(), String> {
+    if let Some(node_req) = &package.engines_node {
+        if let Some(node_version) = node_version {
+            if !node_req.matches(node_version) {
+                return Err(format!(
+                    "{} requires node '{}', current is {}",
+                    package.name,
+                    node_req.display(),
+                    node_version
+                ));
+            }
+        }
+    }
+
+    let os = current_node_os();
+    if !constraint_allows_current(&package.os_constraints, os) {
+        return Err(format!(
+            "{} is not supported on os '{}': {:?}",
+            package.name, os, package.os_constraints
+        ));
+    }
+
+    let cpu = current_node_cpu();
+    if !constraint_allows_current(&package.cpu_constraints, cpu) {
+        return Err(format!(
+            "{} is not supported on cpu '{}': {:?}",
+            package.name, cpu, package.cpu_constraints
+        ));
+    }
+
+    Ok(())
+}
+
+fn create_bin_links(
+    package: &PackageInfo,
+    package_root: &Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if package.bin_entries.is_empty() {
+        return Ok(());
+    }
+
+    let bin_dir = Path::new("node_modules").join(".bin");
+    fs::create_dir_all(&bin_dir)?;
+
+    for (bin_name, rel_path) in &package.bin_entries {
+        let src = package_root.join(rel_path);
+        let dst = bin_dir.join(bin_name);
+
+        if dst.exists() {
+            fs::remove_file(&dst)?;
+        }
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&src, &dst)?;
+            if let Ok(metadata) = fs::metadata(&src) {
+                let mut perms = metadata.permissions();
+                perms.set_mode(0o755);
+                let _ = fs::set_permissions(&src, perms);
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            let script = format!(
+                "@echo off\r\nnode \"%~dp0\\..\\{}\\{}\" %*\r\n",
+                package.name,
+                rel_path.replace('/', "\\")
+            );
+            fs::write(dst.with_extension("cmd"), script)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn run_lifecycle_scripts(
+    package: &PackageInfo,
+    package_root: &Path,
+    options: &InstallOptions,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if options.ignore_scripts || package.lifecycle_scripts.is_empty() {
+        return Ok(());
+    }
+
+    for script_name in ["preinstall", "install", "postinstall"] {
+        let Some(script_cmd) = package.lifecycle_scripts.get(script_name) else {
+            continue;
+        };
+
+        options.debug(&format!("running {} for {}", script_name, package.name));
+
+        #[cfg(unix)]
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(script_cmd)
+            .current_dir(package_root)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()?;
+
+        #[cfg(windows)]
+        let status = Command::new("cmd")
+            .arg("/C")
+            .arg(script_cmd)
+            .current_dir(package_root)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()?;
+
+        if !status.success() {
+            return Err(format!(
+                "lifecycle script '{}' failed for {} with status {}",
+                script_name, package.name, status
+            )
+            .into());
+        }
+    }
+
+    Ok(())
+}
+
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     fs::create_dir_all(dst)?;
     for entry in fs::read_dir(src)? {
@@ -795,26 +1339,42 @@ fn symlink_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::os::windows::fs::symlink_dir(src, dst)
 }
 
-fn build_nested_node_modules(packages: &[ResolvedPackage], options: InstallOptions) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn build_nested_node_modules(packages: &[ResolvedPackage], options: &InstallOptions) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if options.hoist_strategy == "none" {
+        return Ok(());
+    }
+
     let root = Path::new("node_modules");
+    let all_package_names = packages
+        .iter()
+        .map(|p| p.info.name.clone())
+        .collect::<Vec<_>>();
+
     for package in packages {
         let package_root = root.join(&package.info.name);
         let nested = package_root.join("node_modules");
         fs::create_dir_all(&nested)?;
 
-        for dep_name in package
-            .info
-            .dependencies
-            .keys()
-            .chain(package.info.peer_dependencies.keys())
-            .chain(package.info.optional_dependencies.keys())
-        {
-            let hoisted_dep = root.join(dep_name);
+        let dependency_names = if options.hoist_strategy == "aggressive" {
+            all_package_names.clone()
+        } else {
+            package
+                .info
+                .dependencies
+                .keys()
+                .chain(package.info.peer_dependencies.keys())
+                .chain(package.info.optional_dependencies.keys())
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        for dep_name in dependency_names {
+            let hoisted_dep = root.join(&dep_name);
             if !hoisted_dep.exists() {
                 continue;
             }
 
-            let nested_dep = nested.join(dep_name);
+            let nested_dep = nested.join(&dep_name);
             if nested_dep.exists() {
                 continue;
             }
@@ -833,22 +1393,60 @@ fn build_nested_node_modules(packages: &[ResolvedPackage], options: InstallOptio
     Ok(())
 }
 
+pub async fn handle_ci_command_async(
+    options: InstallOptions,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if !Path::new("package-lock.json").exists() {
+        return Err("package-lock.json not found. `rnp ci` requires a lockfile.".into());
+    }
+
+    let workspace_packages = load_workspace_packages()?;
+    let manifest_path = workspace_manifest_path(options.workspace.as_deref(), &workspace_packages)?;
+    if !manifest_path.exists() {
+        return Err(format!("{} not found", manifest_path.display()).into());
+    }
+
+    let lock_data = fs::read_to_string("package-lock.json")?;
+    let lockfile: PackageLock = serde_json::from_str(&lock_data)?;
+    ensure_lockfile_in_sync(&lockfile, &manifest_path)?;
+
+    let packages = packages_from_lockfile(&lockfile)?;
+    if packages.is_empty() {
+        options.info("Nothing to install from lockfile.");
+        return Ok(());
+    }
+
+    let resolver = DependencyResolver::new(workspace_packages);
+    let node_version = current_node_version();
+    let total = resolver
+        .install_packages_parallel(&packages, &options, node_version)
+        .await?;
+    build_nested_node_modules(&packages, &options)?;
+
+    options.success(&format!("Installed {} package(s) from lockfile", total));
+    Ok(())
+}
+
 // Updated main install function
 pub async fn handle_install_command_async(
     package: &str,
     options: InstallOptions,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let path = "package.json";
+    let workspace_packages = load_workspace_packages()?;
+    let manifest_path = workspace_manifest_path(options.workspace.as_deref(), &workspace_packages)?;
 
-    if !std::path::Path::new(path).exists() {
-        options.warn("package.json not found. Please run `rnp init` first.");
+    if !manifest_path.exists() {
+        options.warn(&format!("{} not found. Please run `rnp init` first.", manifest_path.display()));
         return Ok(());
     }
 
     options.info(&format!("Resolving dependency tree for {}...", package));
 
-    let workspace_packages = load_workspace_packages()?;
     let mut resolver = DependencyResolver::new(workspace_packages);
+    let node_version = current_node_version();
+    if node_version.is_none() {
+        options.warn("Node.js version could not be detected; engines checks are skipped.");
+    }
     let locked_versions = if options.no_package_lock {
         HashMap::new()
     } else {
@@ -878,16 +1476,18 @@ pub async fn handle_install_command_async(
 
     options.info(&format!("Resolved {} to version {}", package, root_package.info.version));
 
-    validate_peer_dependencies(&packages, options);
+    validate_peer_dependencies(&packages, &options);
 
     // Phase 2: Install packages in parallel
-    let total_installed = resolver.install_packages_parallel(&packages, options).await?;
+    let total_installed = resolver
+        .install_packages_parallel(&packages, &options, node_version)
+        .await?;
 
     // Phase 3: Build nested node_modules links while keeping hoisted packages at root
-    build_nested_node_modules(&packages, options)?;
+    build_nested_node_modules(&packages, &options)?;
 
     // Phase 4: Update package.json with the ROOT package version
-    update_package_json(package, &root_package.info.version, options).await?;
+    update_package_json(&manifest_path, package, &root_package.info.version, &options).await?;
 
     // Phase 5: Generate lockfile unless disabled by flag
     if options.no_package_lock {
@@ -902,12 +1502,13 @@ pub async fn handle_install_command_async(
 }
 
 async fn update_package_json(
+    package_json_path: &Path,
     package: &str,
     resolved_version: &Version,
-    options: InstallOptions,
+    options: &InstallOptions,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Read existing package.json
-    let data = std::fs::read_to_string("package.json")?;
+    let data = std::fs::read_to_string(package_json_path)?;
     let mut json: serde_json::Value = serde_json::from_str(&data)?;
 
     // Ensure package.json root is a valid JSON object
@@ -928,7 +1529,7 @@ async fn update_package_json(
 
     // Write back with pretty formatting
     let formatted = serde_json::to_string_pretty(&json)?;
-    std::fs::write("package.json", formatted)?;
+    std::fs::write(package_json_path, formatted)?;
 
     options.success(&format!("Updated package.json with {}@^{}", package, resolved_version));
     Ok(())
