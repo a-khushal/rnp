@@ -1,5 +1,5 @@
-use sha1::{Digest as Sha1Digest, Sha1};
-use sha2::Sha256;
+use sha1::Sha1;
+use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::fs::create_dir_all;
 use std::path::PathBuf;
